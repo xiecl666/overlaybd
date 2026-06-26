@@ -114,6 +114,8 @@ public:
     std::vector<ClusterMapping> get_cluster_mappings();
     ssize_t read_data(uint64_t logical_offset, void *buf, size_t count);
 
+    ssize_t read_cluster_direct(const ClusterMapping &cm, void *buf);
+
     uint64_t virtual_size() const { return virtual_size_; }
     uint32_t cluster_size()  const { return cluster_size_; }
     uint32_t cluster_bits()  const { return cluster_bits_; }
@@ -875,6 +877,55 @@ ssize_t Qcow2Reader::read_data(uint64_t logical_offset, void *buf, size_t count)
     return total_read;
 }
 
+ssize_t Qcow2Reader::read_cluster_direct(const ClusterMapping &cm, void *buf) {
+    if (cm.is_zero || cm.is_unallocated) {
+        memset(buf, 0, cluster_size_);
+        return cluster_size_;
+    }
+
+    if (cm.is_compressed) {
+        // Read compressed data directly from physical offset
+        std::vector<uint8_t> comp_buf(static_cast<size_t>(cm.compressed_size));
+        ssize_t n = ::pread(fd_, comp_buf.data(), static_cast<size_t>(cm.compressed_size),
+                            cm.physical_offset);
+        if (n != static_cast<ssize_t>(cm.compressed_size)) {
+            fprintf(stderr, "ERROR: read compressed cluster failed at offset %lu\n",
+                    static_cast<unsigned long>(cm.physical_offset));
+            return -1;
+        }
+
+        z_stream strm = {};
+        strm.next_in = comp_buf.data();
+        strm.avail_in = static_cast<uInt>(cm.compressed_size);
+
+        int ret = inflateInit2(&strm, -MAX_WBITS);
+        if (ret != Z_OK) {
+            fprintf(stderr, "ERROR: inflateInit2 failed: %d\n", ret);
+            return -1;
+        }
+
+        strm.next_out = static_cast<uint8_t *>(buf);
+        strm.avail_out = static_cast<uInt>(cluster_size_);
+
+        ret = inflate(&strm, Z_FINISH);
+        inflateEnd(&strm);
+        if (ret != Z_STREAM_END) {
+            fprintf(stderr, "ERROR: decompression failed at physical offset %lu, ret=%d\n",
+                    static_cast<unsigned long>(cm.physical_offset), ret);
+            return -1;
+        }
+        return cluster_size_;
+    }
+
+    ssize_t n = ::pread(fd_, buf, cluster_size_, cm.physical_offset);
+    if (n < 0) {
+        fprintf(stderr, "ERROR: pread failed at physical offset %lu\n",
+                static_cast<unsigned long>(cm.physical_offset));
+        return -1;
+    }
+    return n;
+}
+
 // Write qcow2 clusters to an existing overlaybd ImageFile.
 // Used by overlaybd-apply --from_qcow2.
 
@@ -952,10 +1003,10 @@ int convert_qcow2_to_imgfile(const char *input_path, IFile *target,
                 return -1;
             }
         } else {
-            ssize_t n = reader.read_data(cm.logical_offset, cluster_buf.data(), cm.cluster_size);
+            ssize_t n = reader.read_cluster_direct(cm, cluster_buf.data());
             if (n < 0) {
-                fprintf(stderr, "ERROR: Failed to read cluster at logical offset %lu\n",
-                        static_cast<unsigned long>(cm.logical_offset));
+                fprintf(stderr, "ERROR: Failed to read cluster at physical offset %lu\n",
+                        static_cast<unsigned long>(cm.physical_offset));
                 return -1;
             }
             if (n < static_cast<ssize_t>(cm.cluster_size)) {
